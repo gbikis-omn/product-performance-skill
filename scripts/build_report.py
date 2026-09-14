@@ -279,10 +279,53 @@ def load_feed(path, field_name):
     return df
 
 
-def build_master(ga4_df, google_df, meta_df, feed_df=None, feed_field_name=None):
-    n_before = len(ga4_df)
+NO_GA4_LABEL = "(no GA4 activity)"
 
-    master = ga4_df.merge(google_df, on="item_id", how="left")
+
+def build_master(ga4_df, google_df, meta_df, feed_df=None, feed_field_name=None):
+    """Build the merged master table over the UNION of item_ids seen in any
+    of the three sources - not just the ones GA4 happened to report.
+
+    Changed 2026-09-14 (explicit user request, ProteinMax.gr): the original
+    version left-joined spend onto ga4_df, so an item_id with real Google
+    Ads/Meta spend but zero GA4 views/cart/purchases in the period never
+    appeared anywhere in the report - its spend was silently dropped from
+    every total. That is a legitimate design choice some users want (spend
+    with no matching GA4 row can't be attributed to a real product-level
+    conversion story), but it is NOT what this user wants: they want that
+    spend visible, grouped under a clearly-labelled bucket, so nothing
+    disappears from Total Spend / Grand Total silently.
+
+    Every item_id from GA4 ∪ Google Ads ∪ Meta is now a row in master. Rows
+    with no GA4 data get items_viewed/cart/purchased/revenue = 0 and
+    item_brand/every item_category* column/Category = NO_GA4_LABEL, so they
+    surface as their own explicit "(no GA4 activity)" group in Category
+    Analysis, Brand Analysis and Brand & Category Analysis - summable,
+    visible, never silently missing - instead of vanishing from the report.
+    """
+    cat_cols = [c for c in ga4_df.columns if c.startswith("item_category")]
+
+    ga4_ids = set(ga4_df["item_id"])
+    all_ids = ga4_ids | set(google_df["item_id"]) | set(meta_df["item_id"])
+    spend_only_ids = all_ids - ga4_ids
+    n_before = len(all_ids)
+
+    master = pd.DataFrame({"item_id": sorted(all_ids)})
+    master = master.merge(ga4_df, on="item_id", how="left")
+    assert len(master) == n_before, (
+        f"GA4 merge changed row count ({n_before} -> {len(master)}) - "
+        f"ga4_df must have a duplicate item_id that survived its own "
+        f"groupby, which should be impossible. Do not trust this report."
+    )
+    metric_cols = ["items_viewed", "items_added_to_cart", "items_purchased", "item_revenue"]
+    for c in metric_cols:
+        master[c] = master[c].fillna(0.0)
+    master["item_brand"] = master["item_brand"].fillna(NO_GA4_LABEL)
+    for c in cat_cols:
+        master[c] = master[c].fillna(NO_GA4_LABEL)
+    master["Category"] = master[cat_cols].astype(str).agg(">".join, axis=1)
+
+    master = master.merge(google_df, on="item_id", how="left")
     assert len(master) == n_before, (
         f"Google Ads merge changed row count ({n_before} -> {len(master)}) - "
         f"google_df must have a duplicate item_id that survived its own "
@@ -305,26 +348,24 @@ def build_master(ga4_df, google_df, meta_df, feed_df=None, feed_field_name=None)
         )
         master[feed_field_name] = master[feed_field_name].fillna("(not set)")
 
-    matched_ids = set(ga4_df["item_id"])
-    unmatched_google_ids = set(google_df["item_id"]) - matched_ids
-    unmatched_meta_ids = set(meta_df["item_id"]) - matched_ids
-    unmatched_google_spend = google_df.loc[
-        google_df["item_id"].isin(unmatched_google_ids), "Google Ads Spend"
+    spend_only_google_spend = google_df.loc[
+        google_df["item_id"].isin(spend_only_ids), "Google Ads Spend"
     ].sum()
-    unmatched_meta_spend = meta_df.loc[
-        meta_df["item_id"].isin(unmatched_meta_ids), "Meta Spend"
+    spend_only_meta_spend = meta_df.loc[
+        meta_df["item_id"].isin(spend_only_ids), "Meta Spend"
     ].sum()
-    if unmatched_google_ids or unmatched_meta_ids:
-        print(f"[build_report] NOTE: {len(unmatched_google_ids)} item_id(s) "
-              f"(€{unmatched_google_spend:.2f} Google Ads spend) and "
-              f"{len(unmatched_meta_ids)} item_id(s) (€{unmatched_meta_spend:.2f} Meta "
-              f"spend) had ad spend but ZERO GA4 activity in this period. Their spend "
-              f"is EXCLUDED from every tab in this report (the analysis is scoped to "
-              f"items with GA4 activity, matching the reference workbook design). "
-              f"Report the excluded € amounts to the user, not just the item counts - "
-              f"that's what tells them if this is material.", file=sys.stderr)
+    if spend_only_ids:
+        print(f"[build_report] NOTE: {len(spend_only_ids)} item_id(s) had ad spend "
+              f"(€{spend_only_google_spend:.2f} Google Ads + €{spend_only_meta_spend:.2f} "
+              f"Meta) but ZERO GA4 activity in this period. They ARE included in every "
+              f"tab (Master Data and every Analysis tab), grouped under brand AND "
+              f"category '{NO_GA4_LABEL}', with views/cart/purchases/revenue = 0 - their "
+              f"spend is real and counted in every Total Spend / Grand Total, it just "
+              f"has no GA4 performance story to attach to. Report this bucket's € amount "
+              f"to the user explicitly, same as any other brand/category.",
+              file=sys.stderr)
 
-    return master, unmatched_google_ids, unmatched_meta_ids, unmatched_google_spend, unmatched_meta_spend
+    return master, spend_only_ids, spend_only_google_spend, spend_only_meta_spend
 
 
 # --------------------------------------------------------------------------
@@ -612,7 +653,7 @@ def main():
     meta_df = load_spend(args.meta_csv, "item_id", "spend", "Meta Spend")
     feed_df = load_feed(args.feed_csv, args.feed_field_name) if args.feed_csv else None
 
-    master, unmatched_google, unmatched_meta, unmatched_google_spend, unmatched_meta_spend = build_master(
+    master, spend_only_ids, spend_only_google_spend, spend_only_meta_spend = build_master(
         ga4_df, google_df, meta_df, feed_df, args.feed_field_name
     )
 
@@ -681,11 +722,12 @@ def main():
     if conflicts:
         print(f"[build_report] WARNING: {len(conflicts)} item_id(s) had inconsistent "
               f"brand/category labels across the GA4 pull - tell the user.")
-    if unmatched_google or unmatched_meta:
-        print(f"[build_report] WARNING: {len(unmatched_google)} item(s) with Google Ads "
-              f"spend (€{unmatched_google_spend:.2f}) and {len(unmatched_meta)} item(s) "
-              f"with Meta spend (€{unmatched_meta_spend:.2f}) were excluded (no GA4 "
-              f"activity) - tell the user the € amounts, not just the counts.")
+    if spend_only_ids:
+        print(f"[build_report] WARNING: {len(spend_only_ids)} item(s) had ad spend "
+              f"(€{spend_only_google_spend:.2f} Google Ads + €{spend_only_meta_spend:.2f} "
+              f"Meta) but no GA4 activity - INCLUDED in every tab under the "
+              f"'{NO_GA4_LABEL}' brand/category bucket (not excluded). Tell the user "
+              f"this bucket's € amount, same as any other brand/category.")
 
 
 if __name__ == "__main__":

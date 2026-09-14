@@ -180,9 +180,12 @@ python3 ~/.claude/skills/product_performance/scripts/build_report.py \
      όχι AOV εξωφρενικά υψηλό λόγω λάθος currency conversion).
 3. Ανέφερε στον χρήστη με απλά λόγια:
    - Πόσα items μπήκαν στην ανάλυση, grand totals.
-   - **Πόσα item IDs είχαν spend αλλά καθόλου GA4 δραστηριότητα** (και άρα
-     εξαιρέθηκαν) — αυτό είναι σημαντικό εύρημα από μόνο του, όχι απλά ένα
-     τεχνικό detail.
+   - **Πόσα item IDs είχαν spend αλλά καθόλου GA4 δραστηριότητα**, και το €
+     ποσό τους — αυτά ΠΕΡΙΛΑΜΒΑΝΟΝΤΑΙ πλέον στο report κάτω από το
+     `"(no GA4 activity)"` brand/category bucket (όχι εξαιρούνται· βλ.
+     "Design change" ενότητα πιο κάτω) — ανέφερέ το σαν σημαντικό εύρημα
+     από μόνο του, ίδια βαρύτητα με οποιοδήποτε άλλο brand/category, όχι
+     απλά ένα τεχνικό detail.
    - Αν βρέθηκαν item IDs με ασυνεπή brand/category labels μέσα στο διάστημα.
    - Το path του τελικού xlsx.
 
@@ -219,11 +222,17 @@ python3 ~/.claude/skills/product_performance/scripts/build_report.py \
 
 ## Γνωστά όρια / πράγματα που πρέπει να πεις στον χρήστη αν συμβούν
 
-- Ένα item_id με spend σε Meta ή Google Ads αλλά μηδέν GA4 views/cart/
-  purchases δεν εμφανίζεται πουθενά στο report (by design — matching το
-  reference workbook). Αν ο χρήστης θέλει να δει ΚΑΙ αυτά, χρειάζεται
-  διαφορετικό base join (right/full join), πες του το ρητά και ρώτα αν
-  το θέλει πριν αλλάξεις προσέγγιση.
+- **(Άλλαξε 2026-09-14, ρητό αίτημα χρήστη — ProteinMax.gr)** Ένα item_id με
+  spend σε Meta ή Google Ads αλλά μηδέν GA4 views/cart/purchases **εμφανίζεται
+  πλέον** στο report, κάτω από ξεχωριστό brand ΚΑΙ category bucket
+  `"(no GA4 activity)"` σε κάθε tab (Master Data, Category Analysis, Brand
+  Analysis, Brand & Category Analysis) — με views/cart/purchases/revenue=0
+  αλλά πραγματικό spend, μετρημένο κανονικά στο Grand Total. Ο παλιός
+  σχεδιασμός (left join πάνω στο GA4, silent exclusion) έκρυβε πραγματικό
+  spend από το Total Spend χωρίς προειδοποίηση — δες παρακάτω "Design change"
+  ενότητα για την πλήρη ιστορία/επαλήθευση. Αν ένας μελλοντικός χρήστης θέλει
+  ΞΑΝΑ το παλιό (μόνο items με GA4 δραστηριότητα), είναι ρητή αλλαγή
+  σχεδιασμού — ρώτα πριν το κάνεις, μην υποθέσεις.
 - Το Meta `product_id` breakdown ταιριάζει με το GA4/Google Ads `item_id`
   μόνο αν το Meta catalog feed και το Merchant Center feed του πελάτη
   χρησιμοποιούν το ίδιο ID scheme. Αν μετά το merge βλέπεις πολύ χαμηλό
@@ -303,3 +312,46 @@ python3 ~/.claude/skills/product_performance/scripts/build_report.py \
   τον έλεγχο #2 παραπάνω (set intersection πριν/μετά uppercase) σαν μέρος
   του Βήματος 7 sanity check — ειδικά αν δεις "unmatched Google Ads" ή
   "unmatched Meta" ποσά που φαίνονται μεγάλα σε σχέση με το raw pull total.
+
+## Design change: spend-only items πλέον ΠΕΡΙΛΑΜΒΑΝΟΝΤΑΙ, όχι εξαιρούνται (2026-09-14, ProteinMax.gr)
+
+- **Πώς βρέθηκε**: Αφού διορθώθηκε το case-bug παραπάνω, ο χρήστης παρατήρησε
+  ότι το Google Ads Data tab + Meta Data tab (raw, ανεπεξέργαστα) έδειχναν
+  σύνολο €5.730,70, ενώ το Brand Analysis/Category Analysis Grand Total
+  έδειχνε €5.664,60 — ζήτησε ρητά εξήγηση + επιβεβαίωση της διαφοράς.
+- **Επιβεβαιωμένη αιτία (όχι bug, by design τότε)**: η διαφορά (€66,10)
+  ήταν ακριβώς το άθροισμα spend από item_id ΧΩΡΙΣ καμία GA4 δραστηριότητα
+  (42 Google Ads item_id = €13,40 + 704 Meta item_id = €52,71) — αυτά ήταν
+  ήδη σκόπιμα εξαιρημένα από κάθε analysis tab by design (matching το
+  reference workbook), απλά ο χρήστης δεν το ήθελε αυτό το design.
+- **Ρητό αίτημα χρήστη**: να εμφανίζονται ΚΑΙ αυτά, όχι να εξαφανίζονται.
+- **Fix**: `build_master()` ξαναγράφτηκε — αντί για `ga4_df.merge(google_df,
+  how="left")` (base = μόνο GA4 item_ids), τώρα ο βασικός πίνακας είναι το
+  **UNION** `ga4_ids | google_ids | meta_ids`. Items χωρίς GA4 δραστηριότητα
+  παίρνουν `items_viewed/cart/purchased/revenue = 0` και
+  `item_brand`/κάθε `item_category*`/`Category` = σταθερό sentinel string
+  `"(no GA4 activity)"` (μεταβλητή `NO_GA4_LABEL` στην κορυφή του script) —
+  εμφανίζονται σαν δική τους ξεχωριστή γραμμή σε κάθε Analysis tab, με το
+  πραγματικό τους spend, μετρημένο κανονικά στο Grand Total.
+- **Επαλήθευση live (ίδιο 11ήμερο ProteinMax dataset)**:
+  - Items στο report: 3.419 → **4.132** (+713, ακριβώς το πλήθος spend-only
+    item_ids: 42 Google Ads + 704 Meta, με μικρή επικάλυψη ανάμεσά τους).
+  - Grand Total Spend: €5.664,60 → **€5.730,70** = ακριβώς ίσο με
+    Google Ads Data tab + Meta Data tab raw σύνολο (0.0000 διαφορά).
+  - Νέα γραμμή `"(no GA4 activity)"` σε Brand Analysis: spend=€66,10,
+    views/cart/purchases/revenue=0, AOV/rates=None (σωστό, safe_div
+    επιστρέφει None όταν ο denominator=0) — ίδια γραμμή σε Category
+    Analysis ως `"(no GA4 activity)>(no GA4 activity)"` (ακολουθεί το ίδιο
+    ">"-join convention με κάθε άλλη Category τιμή).
+  - Brand-level recompute check (χειροκίνητο άθροισμα Total Spend ανά brand
+    από Master Data vs Brand Analysis tab): **122/122 brands exact match**
+    (121 πραγματικά brands + το νέο "(no GA4 activity)" bucket), 0
+    mismatches.
+  - Reconciliation self-checks του ίδιου του script (leaf-rows sum, grand
+    total ανά tab) πέρασαν όλα χωρίς AssertionError.
+- **Σημαντικό για μελλοντικά reports**: αν ο χρήστης ΔΕΝ αναφέρει ρητά ότι
+  θέλει το παλιό (μόνο items με GA4 δραστηριότητα), default πλέον είναι να
+  ΠΕΡΙΛΑΜΒΑΝΟΝΤΑΙ τα spend-only items — αυτό είναι το τρέχον production
+  behavior του script, όχι πια το legacy left-join. Πάντα ανέφερε στον
+  χρήστη το μέγεθος του `"(no GA4 activity)"` bucket ρητά (€ ποσό + πλήθος
+  items) στο Βήμα 7, ίδια βαρύτητα με οποιοδήποτε άλλο brand/category.
