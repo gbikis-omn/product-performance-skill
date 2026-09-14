@@ -82,7 +82,7 @@ def normalize_id_series(s):
     from every source (GA4, Google Ads, Meta, feed) so all four end up in
     the same comparable shape before anything gets merged.
 
-    Three real risks this guards against, each one found in practice while
+    Four real risks this guards against, each one found in practice while
     building/testing this skill - not hypothetical:
 
       1. Meta's `insights` breakdown by product_id returns a COMPOSITE
@@ -100,11 +100,32 @@ def normalize_id_series(s):
          picked up a trailing ".0" (e.g. pandas/json round-tripping an int
          through a float column) while another source kept it as a clean
          digit string - same silent-join-failure risk.
+      4. Different sources report the SAME real id in different letter
+         case. Confirmed live on the ProteinMax.gr account (2026-09-14):
+         Google Ads' `segments.product_item_id` came back lowercase
+         ('im4966') while GA4's item_id / the Merchant Center feed for the
+         exact same product is uppercase ('IM4966'). This is a silent,
+         total failure, not a partial one - pandas' `merge(on="item_id")`
+         is case-sensitive, so it produced ZERO matches out of 1,476 Google
+         Ads item_ids that period (97% of which matched once uppercased),
+         and 100% of that channel's spend (thousands of euros, both times)
+         silently vanished from two already-delivered reports with no
+         error - the run even printed a NOTE claiming those items "had ad
+         spend but ZERO GA4 activity", which was flatly wrong; they had
+         GA4 activity, the join just couldn't see it. Case-fold every id to
+         uppercase before comparison so this can never happen silently
+         again, for every source, every time - not just when someone
+         happens to notice the numbers look low.
 
-    Real alphanumeric IDs/SKUs are left completely untouched (they don't
-    contain ", " followed by more text, and we only strip a trailing ".0"
-    when the rest of the string is purely digits) - so this never corrupts
-    a legitimate id, it only ever fixes the known-bad shapes above.
+    Real alphanumeric IDs/SKUs are left completely untouched by risks 1-3
+    (they don't contain ", " followed by more text, and a trailing ".0" is
+    only stripped when the rest of the string is purely digits) - so those
+    steps never corrupt a legitimate id, they only ever fix the known-bad
+    shapes above. Risk 4's uppercase fold is applied unconditionally (safe:
+    idempotent on ids that are already uppercase, and it is the join key
+    only - see build_master(), the *displayed* item_id in the output comes
+    from the GA4 dataframe, which goes through this same normalization, so
+    display and join key always match).
     """
     s = s.astype(str).str.strip()
 
@@ -118,7 +139,17 @@ def normalize_id_series(s):
     s = composite_id.where(composite_id.notna(), s).str.strip()
 
     is_float_looking = s.str.match(r"^\d+\.0$")
-    return s.where(~is_float_looking, s.str.replace(r"\.0$", "", regex=True))
+    s = s.where(~is_float_looking, s.str.replace(r"\.0$", "", regex=True))
+
+    upper = s.str.upper()
+    n_case_changed = (upper != s).sum()
+    if n_case_changed:
+        print(f"[build_report] NOTE: case-folded {n_case_changed} id value(s) to "
+              f"uppercase for matching (e.g. mixed/lower-case ids like Google Ads' "
+              f"segments.product_item_id vs GA4/feed ids that are upper-case) - "
+              f"this is expected and required for the join to work; see "
+              f"normalize_id_series() docstring risk #4.", file=sys.stderr)
+    return upper
 
 
 def aggregate_ga4(path, category_levels):

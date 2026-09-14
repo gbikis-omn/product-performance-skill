@@ -161,7 +161,16 @@ python3 ~/.claude/skills/product_performance/scripts/build_report.py \
 
 1. Διάβασε το stdout του script — grand totals (views/cart/purchases/revenue/
    spend), αριθμό conflicts (item_id με πολλαπλά labels), αριθμό unmatched
-   spend items.
+   spend items, και το `case-folded N id value(s)` NOTE (αν N Google Ads
+   ή Meta ids φαίνεται κοντά στο σύνολο των ids εκείνης της πηγής, καλό
+   σημάδι — σημαίνει ότι το case-fold δούλεψε στα σωστά ids· βλ. §"CRITICAL
+   bug" πιο κάτω για το γιατί αυτός ο έλεγχος υπάρχει).
+   **Πάντα**, ανεξάρτητα από το αν κάτι φαίνεται ύποπτο, έλεγξε το unmatched
+   Google Ads/Meta ποσό σαν % του αντίστοιχου raw pull total (Βήμα 5) — αν
+   είναι πάνω από ~20-30%, κάνε τον έλεγχο set-intersection πριν/μετά
+   uppercase (βλ. μεθοδολογία στο §"CRITICAL bug" πιο κάτω) πριν πεις στον
+   χρήστη ότι το spend "απλά δεν είχε GA4 δραστηριότητα" — μπορεί να είναι
+   ξανά ID mismatch, όχι απουσία δραστηριότητας.
 2. Άνοιξε το xlsx (π.χ. με openpyxl) και έλεγξε ότι:
    - Το Grand Total row σε κάθε analysis tab έχει τα ίδια views/cart/purchases/
      revenue/spend σε ΟΛΑ τα tabs (πρέπει να ταυτίζονται — αν το script
@@ -222,6 +231,15 @@ python3 ~/.claude/skills/product_performance/scripts/build_report.py \
   απαραίτητα απλά "δεν υπάρχει spend".
 - Ζωντανά sheets/λογαριασμοί αλλάζουν σε real time — αν ξανατρέξεις το ίδιο
   pull λίγα λεπτά αργότερα και τα νούμερα διαφέρουν ελαφρώς, δεν είναι bug.
+- **Case-sensitivity στο item_id join (διορθωμένο 2026-09-14, βλ. live test
+  παρακάτω)**: `normalize_id_series()` πλέον κάνει uppercase ΚΑΘΕ id πριν το
+  merge, γιατί βρέθηκε live ότι το Google Ads `segments.product_item_id`
+  μπορεί να επιστρέφει lowercase ids ενώ το GA4 item_id/feed id για το ΙΔΙΟ
+  προϊόν είναι uppercase — χωρίς αυτό το fix, το merge αποτυγχάνει 100%
+  σιωπηλά (καμία exception, απλά "0 spend" και λάθος NOTE μήνυμα ότι το
+  item "δεν είχε GA4 δραστηριότητα"). Αν δεις στο stdout πολλά
+  `case-folded N id value(s)`, είναι αναμενόμενο/θετικό σημάδι ότι το fix
+  δούλεψε — όχι κάτι για ανησυχία.
 
 ## Τι έχει πραγματικά δοκιμαστεί live (2026-09-11, Kanellopoulos)
 
@@ -247,3 +265,41 @@ python3 ~/.claude/skills/product_performance/scripts/build_report.py \
 - **Δεν έχει δοκιμαστεί ακόμα live**: το "μόνο Category Analysis, χωρίς
   Brand" path (Βήμα 3, δεύτερη επιλογή), και το feed field μέσω `mc-mcp`
   (χρησιμοποιήθηκε raw feed URL και στα δύο live tests μέχρι τώρα).
+
+## CRITICAL bug βρέθηκε + διορθώθηκε live (2026-09-14, ProteinMax.gr)
+
+- **Τι συνέβη**: 2 reports παραδόθηκαν στον χρήστη (7ήμερο 2026-09-07/13 και
+  11ήμερο 2026-08-17/27, `--category-levels 2 --include-brand-analysis`,
+  χωρίς feed) με το **100% του Google Ads spend σιωπηλά εξαφανισμένο** από
+  Master Data / Category Analysis / Brand Analysis / Grand Total. Ο χρήστης
+  ζήτησε ρητά αναλυτικό έλεγχο ("είσαι 100% σίγουρος;") — χωρίς αυτή την
+  ερώτηση το bug θα περνούσε απαρατήρητο, γιατί το script δεν πετάει error.
+- **Root cause**: Google Ads `shopping_performance_view.segments.product_item_id`
+  επέστρεψε lowercase ids (π.χ. `im4966`) ενώ το GA4 item_id/Merchant Center
+  feed για το ΙΔΙΟ προϊόν είναι uppercase (`IM4966`). Το `normalize_id_series()`
+  ΔΕΝ έκανε case folding πριν το fix, το pandas `merge(on="item_id")` είναι
+  case-sensitive → **0 exact matches / 1.476-1.155 Google Ads item_ids και
+  στα δύο reports**, ενώ 94-97% θα ταίριαζαν uppercased. Το script μάλιστα
+  τύπωνε ένα εντελώς λάθος NOTE ("αυτά τα items δεν είχαν GA4 δραστηριότητα")
+  — η πραγματική αιτία ήταν αποκλειστικά case mismatch, όχι έλλειψη δραστηριότητας.
+- **Πώς εντοπίστηκε (μεθοδολογία επαλήθευσης — επανέλαβέ την όποτε ο χρήστης
+  ζητήσει έλεγχο)**: (1) sum raw pull == sum converted CSV, ανά πηγή — ΟΚ και
+  στις δύο πλευρές. (2) `set(ga4 item_ids) & set(google_ads item_ids)` →
+  0 exact matches, αλλά 94-97% matches αν γίνει `.upper()` σε ένα από τα δύο
+  σύνολα — αυτό απέδειξε το case bug άμεσα, όχι απλά "λίγο spend λείπει".
+  (3) Ξαναϋπολογίστηκε χειροκίνητα το Total Spend ανά brand από το Master
+  Data tab και συγκρίθηκε με το Brand Analysis tab — 0 mismatches σε 121
+  brands, που απέδειξε ότι η ΑΘΡΟΙΣΗ ήταν πάντα σωστή, το πρόβλημα ήταν
+  αποκλειστικά στο ποια δεδομένα μπήκαν στο merge.
+- **Fix**: `normalize_id_series()` κάνει τώρα `.str.upper()` σε ΚΑΘΕ id από
+  ΚΑΘΕ πηγή (GA4, Google Ads, Meta, feed) πριν οποιοδήποτε merge — μόνιμο
+  fix στο ίδιο το script, όχι μια φορά μόνο. Επαληθεύτηκε live στο ίδιο
+  11ήμερο dataset: unmatched Google Ads έπεσε από 1.476 items (€3.540,55)
+  σε 42 items (€13,40) — δηλαδή 97% matched σωστά μετά το fix. Grand Total
+  spend άλλαξε από €2.137,44 (μόνο Meta, λάθος) σε €5.664,60 (Meta + Google
+  Ads, σωστό). Brand-level recompute check ξανατρέχτηκε μετά το fix: 121/121
+  brands exact match, 0 mismatches.
+- **Συμπέρασμα για μελλοντικά reports**: πάντα, μετά από κάθε report, κάνε
+  τον έλεγχο #2 παραπάνω (set intersection πριν/μετά uppercase) σαν μέρος
+  του Βήματος 7 sanity check — ειδικά αν δεις "unmatched Google Ads" ή
+  "unmatched Meta" ποσά που φαίνονται μεγάλα σε σχέση με το raw pull total.
